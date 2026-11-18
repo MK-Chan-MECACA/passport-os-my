@@ -37,11 +37,9 @@ void radio_player_set_station(std::size_t index);
 std::size_t radio_player_station_index();
 std::size_t radio_player_station_count();
 RadioStation radio_player_station(std::size_t index);
-bool radio_player_replace_stations(const RadioStation *stations, std::size_t count);
-// Installs a catalog and keeps listening to the station the user last chose
-// when the new catalog still offers it, so a restart resumes where it left off.
-bool radio_player_replace_stations_resuming(const RadioStation *stations,
-                                           std::size_t count);
+class RadioStationList;
+// Takes the discovered list and resumes the remembered station by name.
+bool radio_player_replace_stations_resuming(RadioStationList &stations);
 // Same persisted system volume used by Settings and Xiaozhi, including 0=mute.
 void radio_player_set_volume(uint8_t volume);
 uint8_t radio_player_volume();

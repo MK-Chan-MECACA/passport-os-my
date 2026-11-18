@@ -1,4 +1,5 @@
 #include "radio_presets.h"
+#include "radio_station_list.h"
 #include "radio_player.h"
 #include "radio_stream_buffer.h"
 #include "radio_source.h"
@@ -41,7 +42,11 @@ static_assert(kStreamStackBytes + kInputSize + kOutputSize + kReaderStackBytes <
 StaticTask_t s_stream_tcb;
 StaticTask_t s_reader_tcb;
 constexpr std::size_t kLevelCount = 18;
-constexpr std::size_t kMaxStations = 10;
+#ifdef PASSPORT_RADIO_HLS_TEST
+constexpr std::size_t kCatalogBytes = (audio_workspace::radio::kStationBytes - RadioSource::kHlsWorkspaceBytes) & ~size_t(15);
+#else
+constexpr std::size_t kCatalogBytes = audio_workspace::radio::kStationBytes;
+#endif
 // Consecutive silent failures tolerated before moving to the next station.
 constexpr uint8_t kMaxFailedAttempts = 3;
 // Two dead stations in a row is a network problem (hotspot without data,
@@ -59,16 +64,16 @@ std::atomic<TaskHandle_t> s_player_task{nullptr};
 SemaphoreHandle_t s_player_stopped;
 SemaphoreHandle_t s_station_mutex;
 bool s_decoders_registered;
-RadioStation *s_stations;
+RadioStationList s_stations;
 
 RadioStation station_snapshot(std::size_t index) {
     RadioStation station = {};
-    if (!s_stations || !s_station_mutex ||
+    if (!s_station_mutex ||
         xSemaphoreTake(s_station_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
         return station;
     }
     const std::size_t count = std::max<std::size_t>(s_station_count.load(), 1);
-    station = s_stations[index % count];
+    station = s_stations.size() ? s_stations.at(index % count) : kRadioPresets[index % count];
     xSemaphoreGive(s_station_mutex);
     return station;
 }
@@ -117,39 +122,6 @@ bool load_station_name(char *name, std::size_t capacity) {
         return false;
     }
     return name[0] != '\0';
-}
-
-// Installs a catalog under the station mutex and reports the index that should
-// stay selected. `preferred_name` keeps the previous station when the fresh
-// catalog still carries it.
-bool install_stations(const RadioStation *stations, std::size_t count,
-                      const char *preferred_name, std::size_t *selected) {
-    if (!stations || count == 0 || !s_stations || !s_station_mutex) return false;
-    count = std::min(count, kMaxStations);
-
-    // Stop the current request before replacing its backing catalog. The
-    // streaming task uses a value snapshot, so the swap is atomic to users.
-    s_generation.fetch_add(1, std::memory_order_acq_rel);
-    if (xSemaphoreTake(s_station_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
-    std::memcpy(s_stations, stations, count * sizeof(RadioStation));
-    if (count < kMaxStations) {
-        std::memset(s_stations + count, 0,
-                    (kMaxStations - count) * sizeof(RadioStation));
-    }
-    std::size_t index = 0;
-    if (preferred_name && preferred_name[0]) {
-        for (std::size_t i = 0; i < count; ++i) {
-            if (std::strcmp(s_stations[i].name, preferred_name) == 0) {
-                index = i;
-                break;
-            }
-        }
-    }
-    s_station_count.store(count, std::memory_order_release);
-    s_station_index.store(index, std::memory_order_release);
-    xSemaphoreGive(s_station_mutex);
-    if (selected) *selected = index;
-    return true;
 }
 
 bool request_still_current(uint32_t generation, std::size_t station) {
@@ -284,14 +256,11 @@ StreamResult stream_station(std::size_t station, uint32_t generation) {
     radio_ui_set_playback(RadioPlaybackState::Connecting, "Connecting to station");
 
     struct Request { uint32_t generation; std::size_t station; std::atomic<bool> stop{false}; } request{generation, station};
-    // Use the unused auxiliary tail rather than fragment AAC's large heap block.
-    constexpr size_t scratch_offset = (sizeof(RadioStation) * kMaxStations + 15) & ~size_t(15);
-    constexpr size_t scratch_bytes = audio_workspace::radio::kStationBytes - scratch_offset;
-    static_assert(scratch_bytes >= RadioSource::kHlsWorkspaceBytes);
     RadioSource source([](void *context) {
         const auto &r = *static_cast<Request *>(context);
         return r.stop.load(std::memory_order_acquire) || !request_still_current(r.generation, r.station);
-    }, &request, audio_workspace::radio::stations() + scratch_offset, scratch_bytes);
+    }, &request, audio_workspace::radio::stations() + kCatalogBytes,
+       audio_workspace::radio::kStationBytes - kCatalogBytes);
 
     bool played_audio = false;
     bool out_of_memory = false;
@@ -593,14 +562,7 @@ bool radio_player_init() {
 
     s_station_mutex = xSemaphoreCreateMutex();
     s_player_stopped = xSemaphoreCreateBinary();
-    static_assert(kMaxStations * sizeof(RadioStation) <= audio_workspace::radio::kStationBytes);
-    static_assert(audio_workspace::radio::kCompressedBytes % alignof(RadioStation) == 0);
-    s_stations = reinterpret_cast<RadioStation *>(audio_workspace::radio::stations());
-    std::memset(s_stations, 0, kMaxStations * sizeof(RadioStation));
     auto cleanup_failed_init = []() {
-        if (s_stations) {
-            s_stations = nullptr;
-        }
         if (s_player_stopped) {
             vSemaphoreDelete(s_player_stopped);
             s_player_stopped = nullptr;
@@ -616,8 +578,7 @@ bool radio_player_init() {
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         return false;
     };
-    if (!s_station_mutex || !s_player_stopped || !s_stations) return cleanup_failed_init();
-    std::memcpy(s_stations, kRadioPresets, sizeof(kRadioPresets));
+    if (!s_station_mutex || !s_player_stopped) return cleanup_failed_init();
     s_station_count.store(sizeof(kRadioPresets) / sizeof(kRadioPresets[0]));
 
     const uint8_t saved_station = load_setting("station", 0);
@@ -686,9 +647,7 @@ bool radio_player_deinit(uint32_t timeout_ms) {
         vSemaphoreDelete(s_station_mutex);
         s_station_mutex = nullptr;
     }
-    if (s_stations) {
-        s_stations = nullptr;
-    }
+    s_stations.clear();
     s_station_count.store(0, std::memory_order_release);
     audio_workspace::release(audio_workspace::Owner::Radio);
     ESP_LOGI(kTag, "Player deinit complete. free=%u largest=%u",
@@ -757,29 +716,22 @@ RadioStation radio_player_station(std::size_t index) {
     return station_snapshot(index);
 }
 
-bool radio_player_replace_stations(const RadioStation *stations, std::size_t count) {
-    std::size_t selected = 0;
-    if (!install_stations(stations, count, nullptr, &selected)) return false;
-
-    save_setting("station", static_cast<uint8_t>(selected));
-    const RadioStation chosen = radio_player_station(selected);
-    save_station_name(chosen.name);
-    radio_ui_set_station(selected, radio_player_station_count(), chosen);
-    ESP_LOGI(kTag, "Installed local catalog with %u stations",
-             static_cast<unsigned>(radio_player_station_count()));
-    return true;
-}
-
-bool radio_player_replace_stations_resuming(const RadioStation *stations,
-                                           std::size_t count) {
+bool radio_player_replace_stations_resuming(RadioStationList &stations) {
+    if (!stations.size() || !s_station_mutex) return false;
     char remembered[sizeof(RadioStation::name)] = {};
-    const bool has_remembered = load_station_name(remembered, sizeof(remembered));
-
     std::size_t selected = 0;
-    if (!install_stations(stations, count, has_remembered ? remembered : nullptr,
-                          &selected)) {
-        return false;
+    const bool has_remembered = load_station_name(remembered, sizeof(remembered));
+    if (has_remembered) {
+        for (std::size_t i = 0; i < stations.size(); ++i) {
+            if (!std::strcmp(stations.at(i).name, remembered)) { selected = i; break; }
+        }
     }
+    if (xSemaphoreTake(s_station_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    s_generation.fetch_add(1, std::memory_order_acq_rel);
+    s_stations.take(stations, audio_workspace::radio::stations(), kCatalogBytes);
+    s_station_count.store(s_stations.size(), std::memory_order_release);
+    s_station_index.store(selected, std::memory_order_release);
+    xSemaphoreGive(s_station_mutex);
 
     save_setting("station", static_cast<uint8_t>(selected));
     const RadioStation chosen = radio_player_station(selected);

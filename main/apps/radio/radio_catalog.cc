@@ -301,11 +301,9 @@ bool enabled(cJSON *entry, const char *name, bool default_value) {
     return cJSON_IsNumber(v) ? v->valueint != 0 : default_value;
 }
 
-void append_station(const char *json, const char *description,
-                    RadioStation *stations, std::size_t capacity, std::size_t &count) {
-    if (count >= capacity) return;
+bool parse_station(const char *json, const char *description, RadioStation &candidate) {
     cJSON *entry = cJSON_Parse(json);
-    if (!entry || !cJSON_IsObject(entry)) { cJSON_Delete(entry); return; }
+    if (!entry || !cJSON_IsObject(entry)) { cJSON_Delete(entry); return false; }
     const char *name = json_string(entry, "name");
     const char *url = json_string(entry, "url_resolved");
     if (!url[0]) url = json_string(entry, "url");
@@ -314,19 +312,18 @@ void append_station(const char *json, const char *description,
     // ignores '+', so "AAC+" matches "AAC". The player re-checks the bytes.
     const bool playable = same_name(codec, "MP3") || same_name(codec, "AAC") ||
                           (!codec[0] && contains(url, ".mp3"));
-    if (name[0] && url[0] && playable && !contains(url, ".m4a") && enabled(entry, "lastcheckok", true) &&
-        !enabled(entry, "hls", false) && std::strlen(url) < sizeof(stations[0].url)) {
-        RadioStation candidate = {};
+    const bool accepted = name[0] && playable && enabled(entry, "lastcheckok", true) &&
+        !enabled(entry, "hls", false) && !contains(url, ".m3u8") && !contains(url, ".m4a") &&
+        (starts_with(url, "http://") || starts_with(url, "https://")) &&
+        std::strlen(url) < sizeof(candidate.url);
+    if (accepted) {
         copy_text(candidate.url, sizeof(candidate.url), url);
-        if ((starts_with(candidate.url, "http://") || starts_with(candidate.url, "https://")) &&
-            !duplicate_url(stations, count, candidate.url)) {
-            copy_text(candidate.name, sizeof(candidate.name), name);
-            copy_text(candidate.description, sizeof(candidate.description), description);
-            candidate.frequency_decihz = parse_frequency(name);
-            stations[count++] = candidate;
-        }
+        copy_text(candidate.name, sizeof(candidate.name), name);
+        copy_text(candidate.description, sizeof(candidate.description), description);
+        candidate.frequency_decihz = parse_frequency(name);
     }
     cJSON_Delete(entry);
+    return accepted;
 }
 
 struct DirectoryServers {
@@ -361,28 +358,28 @@ DirectoryServers directory_servers(RadioCatalogCancelled stop) {
     return servers;
 }
 
-void query_directory(const DirectoryServers &servers, const RadioLocation &location,
+template<class Emit>
+bool query_directory(const DirectoryServers &servers,
                      const char *field, const char *value, const char *description,
-                     RadioStation *stations, std::size_t capacity, std::size_t &count,
-                     RadioCatalogCancelled stop) {
-    if (cancelled(stop) || count >= capacity || (field && !value[0]) || !servers.count) return;
-    char filter[176] = {}, country[16] = {};  // "&name=<encoded>", empty for the whole country
+                     RadioCatalogCancelled stop, Emit emit) {
+    if (cancelled(stop) || (field && !value[0]) || !servers.count) return false;
+    char filter[176] = {};  // "&name=<encoded>", empty for the whole country
     if (field) {
         const int prefix = std::snprintf(filter, sizeof(filter), "&%s=", field);
         if (prefix > 0 && static_cast<std::size_t>(prefix) < sizeof(filter))
             url_encode(value, filter + prefix, sizeof(filter) - prefix);
     }
-    url_encode(location.country_code, country, sizeof(country));
     auto *object = static_cast<char *>(std::malloc(kObjectCapacity));
-    if (!object) return;
+    if (!object) return false;
+    bool complete = false;
     const std::size_t start = servers.preferred < servers.count ? servers.preferred : 0;
     for (std::size_t step = 0; step < servers.count && !cancelled(stop); ++step) {
         const std::size_t i = (start + step) % servers.count;
         char url[384];
         std::snprintf(url, sizeof(url),
-            "http://%s/json/stations/search?countrycode=%s%s"
-            "&hidebroken=true&bitrateMax=96&order=clickcount&reverse=true&limit=20",
-            servers.hosts[i], country, filter);
+            "http://%s/json/stations/search?countrycode=MY%s"
+            "&hidebroken=true&order=clickcount&reverse=true",
+            servers.hosts[i], filter);
         esp_http_client_config_t config = {};
         config.url = url;
         config.timeout_ms = kHttpTimeoutMs;
@@ -404,22 +401,26 @@ void query_directory(const DirectoryServers &servers, const RadioLocation &locat
                         success = n == 0 && parser.Complete() && esp_http_client_is_complete_data_received(client);
                         break;
                     }
+                    bool full = false;
                     parser.Feed(chunk, n, [&](const char *json) {
-                        append_station(json, description, stations, capacity, count);
+                        RadioStation row{};
+                        if (!full && parse_station(json, description, row)) full = !emit(row);
                     });
-                    if (count >= capacity) { success = true; break; }
+                    if (full) { success = true; break; }
                 }
             }
         }
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         if (success) {
+            complete = true;
             servers.preferred = i;
             break; // an empty successful response is not a replica fault
         }
         ESP_LOGW(kTag, "Directory replica failed; trying another server");
     }
     std::free(object);
+    return complete;
 }
 
 std::size_t discover_for_location(RadioStation *stations, std::size_t capacity,
@@ -448,30 +449,23 @@ std::size_t discover_for_location(RadioStation *stations, std::size_t capacity,
             if (!voice_station[0] || std::strstr(stations[i].name, voice_station)) return true;
         return false;
     };
+    const auto local = [&](const RadioStation &row) {
+        if (!duplicate_url(stations, count, row.url)) stations[count++] = row;
+        return count < capacity;
+    };
     const char *query = location->search_city[0] ? location->search_city : location->city;
-    query_directory(servers, *location, "name", query, "Local · Online", stations, capacity, count, stop);
+    query_directory(servers, "name", query, "Local · Online", stop, local);
     if (!voice_ready() && province && count < capacity && !same_name(query, province->name)) {
-        // Stations put the state in their name; the directory's state field is
-        // blank for most Malaysian entries, so it is not queried.
-        query_directory(servers, *location, "name", province->name, "State · Online",
-                        stations, capacity, count, stop);
-    }
-    if (!voice_ready() && count < capacity) {
-        query_directory(servers, *location, nullptr, "", "Malaysia · Online",
-                        stations, capacity, count, stop);
+        query_directory(servers, "name", province->name, "State · Online", stop, local);
     }
     if (cancelled(stop)) return 0;
-    for (const auto &preset : kRadioPresets) {
-        if (count >= capacity) break;
-        if (!duplicate_url(stations, count, preset.url)) stations[count++] = preset;
-    }
     ESP_LOGI(kTag, "Catalog %s / %s: %u stations", location->city, location->region, (unsigned)count);
     return count;
 }
 
 #ifdef ESP_PLATFORM
 struct CatalogCache {
-    static constexpr uint32_t kMagic = 0x52434154;  // "RCAT"
+    static constexpr uint32_t kMagic = 0x4d594c32;  // MY local priority rows, version 2
     static constexpr std::size_t kMaxStations = 8;
     static constexpr int64_t kTtlUs = 30LL * 60 * 1000 * 1000;
     uint32_t magic;
@@ -583,7 +577,7 @@ std::size_t radio_catalog_discover_location(const RadioLocation &preferred,
     const std::size_t found = discover_for_location(stations, capacity, location, stop, voice_station);
 #ifdef ESP_PLATFORM
     if (found > 0 && !cancelled(stop) &&
-        (!voice_station || !voice_station[0] || found >= CatalogCache::kMaxStations)) {
+        (!voice_station || found >= CatalogCache::kMaxStations)) {
         s_catalog_cache.save(want, *location, stations, found);
     }
 #endif
@@ -599,4 +593,33 @@ std::size_t radio_catalog_discover_city(const char *city, RadioStation *stations
     RadioLocation preferred = {};
     if (city) copy_text(preferred.city, sizeof(preferred.city), city);
     return radio_catalog_discover_location(preferred, stations, capacity, location);
+}
+
+bool radio_catalog_discover_all(const RadioLocation &preferred, RadioStationList &list,
+                                RadioLocation *location, RadioCatalogCancelled stop,
+                                const char *voice_station) {
+    if (!location || cancelled(stop)) return false;
+    // RTC holds only a short city/state prefix. Nationwide discovery always
+    // runs, including after cache hits and voice requests.
+    constexpr std::size_t local_capacity = 8;
+    auto *local = static_cast<RadioStation *>(std::calloc(local_capacity, sizeof(RadioStation)));
+    bool ok = true;
+    if (local) {
+        const auto n = radio_catalog_discover_location(preferred, local, local_capacity,
+                                                      location, stop, voice_station);
+        for (std::size_t i = 0; i < n && ok; ++i) ok = list.append(local[i]);
+        std::free(local);
+    }
+    const auto append = [&](const RadioStation &row) {
+        if (!list.contains_url(row.url)) ok = list.append(row);
+        return ok;
+    };
+    for (const auto &preset : kRadioPresets) {
+        if (!ok || cancelled(stop)) break;
+        append(preset);
+    }
+    const bool complete = ok && !cancelled(stop) &&
+        query_directory(directory_servers(stop), nullptr, "", "Malaysia · Online", stop, append);
+    if (!ok || cancelled(stop)) list.clear();
+    return complete && ok && !cancelled(stop);
 }

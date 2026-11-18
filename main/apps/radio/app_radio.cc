@@ -66,16 +66,15 @@ void end_stop_timer() {
 bool catalog_cancelled() { return s_catalog_cancel.load() || !s_radio_active.load(); }
 
 // First station whose name contains the spoken keywords, else the top one.
-std::size_t voice_station(const RadioStation *stations, std::size_t count, const char *keywords) {
+std::size_t voice_station(const RadioStationList &stations, const char *keywords) {
     if (keywords && keywords[0])
-        for (std::size_t i = 0; i < count; ++i) if (std::strstr(stations[i].name, keywords)) return i;
+        for (std::size_t i = 0; i < stations.size(); ++i) if (std::strstr(stations.at(i).name, keywords)) return i;
     return 0;
 }
 
 void catalog_worker(void *arg) {
     (void)arg;
     ESP_LOGI(TAG, "Starting shared city station catalog search...");
-    constexpr std::size_t kDiscoveryCapacity = 8;
     // Release the live decoder/TLS working set before directory HTTP/cJSON.
     radio_player_set_playing(false);
     if (!radio_player_wait_idle(2000) || catalog_cancelled()) {
@@ -86,17 +85,6 @@ void catalog_worker(void *arg) {
         s_catalog_running.store(false);
         xSemaphoreGive(s_catalog_commit);
         ESP_LOGW(TAG, "Catalog deferred: player has not released stream resources");
-        vTaskDelete(nullptr);
-        return;
-    }
-    auto *stations = static_cast<RadioStation *>(
-        std::calloc(kDiscoveryCapacity, sizeof(RadioStation)));
-    if (!stations) {
-        xSemaphoreTake(s_catalog_commit, portMAX_DELAY);
-        if (!catalog_cancelled()) radio_player_set_playing(true);
-        s_catalog_running.store(false);
-        xSemaphoreGive(s_catalog_commit);
-        ESP_LOGE(TAG, "Unable to allocate station catalog");
         vTaskDelete(nullptr);
         return;
     }
@@ -116,20 +104,23 @@ void catalog_worker(void *arg) {
         std::snprintf(preferred.search_city, sizeof(preferred.search_city), "%s", profile.radio_city);
         std::snprintf(preferred.country_code, sizeof(preferred.country_code), "%s", profile.country_code);
     }
-    std::size_t found = radio_catalog_discover_location(preferred, stations, kDiscoveryCapacity,
-                                                       &loc, catalog_cancelled, voice ? voice->detail : nullptr);
+    RadioStationList stations;
+    const bool complete = radio_catalog_discover_all(preferred, stations, &loc, catalog_cancelled,
+                                                  voice ? voice->detail : nullptr);
     // Serialize installation/start with stop; no late playback in the next app.
     xSemaphoreTake(s_catalog_commit, portMAX_DELAY);
     const bool alive = !catalog_cancelled() && s_ui_alive.load();
-    if (alive && found > 0) {
-        ESP_LOGI(TAG, "Location detected: %s (%s), found %u stations", loc.city, loc.region, (unsigned)found);
+    if (alive && stations.size()) {
+        ESP_LOGI(TAG, "Location detected: %s (%s), found %u stations", loc.city, loc.region, (unsigned)stations.size());
         radio_ui_set_location(loc.city);
-        radio_player_replace_stations_resuming(stations, found);
-        if (voice) radio_player_set_station(voice_station(stations, found, voice->detail));
-        s_catalog_installed.store(true);
+        const auto selected = voice ? voice_station(stations, voice->detail) : 0;
+        if (radio_player_replace_stations_resuming(stations)) {
+            if (voice) radio_player_set_station(selected);
+            s_catalog_installed.store(complete);
+        }
     }
     delete voice;
-    std::free(stations);
+    stations.clear(); // FreeRTOS task deletion does not unwind the stack.
     if (alive) {
         // Start the MP3 decoder only after directory HTTP/cJSON is released.
         radio_player_set_playing(true);

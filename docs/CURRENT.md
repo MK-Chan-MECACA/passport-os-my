@@ -19,7 +19,7 @@ Git: the working copy is `~/Claude Code/Passport OS MY` (`~/passport-os` is a sy
 
 ## Malaysia edition changes
 
-See [MY-EDITION.md](MY-EDITION.md) for detail. In short: NetEase removed (music requests go to Radio); Malaysian GeoNames city catalogue; Radio queries Malaysia and accepts MP3 and AAC/AAC+, with six Malaysian MP3 presets; AI Hot replaced by Hacker News Tech News; English UI and Latin-only fonts; English setup pages and a Cloudflare connectivity probe; name "Passport OS MY", version `0.2.0-my.1`; English living docs; English code comments.
+See [MY-EDITION.md](MY-EDITION.md) for detail. In short: NetEase removed (music requests go to Radio); Malaysian GeoNames city catalogue; Radio queries Malaysia and accepts MP3 and AAC/AAC+, with 51 built-in Malaysian streams; AI Hot replaced by Hacker News Tech News; English UI and Latin-only fonts; English setup pages and a Cloudflare connectivity probe; name "Passport OS MY", version `0.2.0-my.1`; English living docs; English code comments.
 
 ## Behaviour inherited from upstream rc.59
 
@@ -32,11 +32,12 @@ See [MY-EDITION.md](MY-EDITION.md) for detail. In short: NetEase removed (music 
 - Re-entering Xiaozhi within 10 minutes reuses the last OTA result from NVS and connects straight to the WebSocket, saving one HTTPS request; one failed connection with it fetches OTA again.
 - Xiaozhi waveform: 13 bars under the robot follow microphone level while listening and playback level while replying, scaled by master volume and coloured by theme. Short text keeps the large robot; text over two lines opens an eight-line reading area.
 - Power savings: serial polling drops from 50 ms to 250 ms while a non-audio foreground app has the screen off; the Xiaozhi screen-off face updates every 1000 ms instead of 50 ms; offline standby rescans at most every 300 s. Button debounce stays at 20 ms × 3. Manual rescans are rate-limited to one per 15 s.
-- Radio voice requests skip the extra directory query when the local target is found. Radio start-up prefill is 8 KiB (16 KiB buffer, 8 KiB refill on underrun).
+- Radio voice requests skip the state lookup when the local target is found. The nationwide list remains available after a voice request. Radio start-up prefill is 8 KiB (16 KiB buffer, 8 KiB refill on underrun).
 
 ## Verification status
 
 - Test and build results for each MY edition step are recorded in MY-EDITION.md.
+- Radio (2026-11-18): the live Malaysian directory and presets produced 109 distinct stream URLs in the host parser. All 51 built-in feeds yielded decodable audio on the host. The regression exercises selection and wraparound with 400 entries.
 - **Not yet checked on a real device:** English UI layout on the physical screen, AAC playback with Wi-Fi + TLS active (decoder needs about 23 KiB with no PSRAM), the English setup pages on a real phone, Xiaozhi with an English agent from Malaysia.
 - **Power and battery life have never been accepted:** there is no current-meter data. Fewer callbacks must not be reported as a percentage of power saved.
 - Real-microphone use, multi-day recurring reminder reliability and the state of external cloud services are not covered by host regression tests. Serial-simulated buttons are not physical-button acceptance.
@@ -45,7 +46,7 @@ See [MY-EDITION.md](MY-EDITION.md) for detail. In short: NetEase removed (music 
 ## Open items
 
 1. Flash 0.2.0-my.1 to a device and check the items listed under "Not yet checked".
-2. If AAC is unstable on hardware, keep the MP3-only presets and consider filtering AAC out of directory results. HLS stays disabled.
+2. Verify nationwide station switching and direct AAC/AAC+ over Wi-Fi on a Passport. Production Radio supports direct streams. HLS stays disabled.
 3. When a current meter is available, build A/B images that differ only in the three power-saving policies and measure Home screen-on, networked screen-off, Xiaozhi idle screen-off and offline scanning (voltage, average and peak current, energy, time), excluding the effect of a computer's USB port on light sleep.
 
 Do not expand scope beyond MY-EDITION.md unless the user asks.

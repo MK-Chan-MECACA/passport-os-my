@@ -20,7 +20,7 @@ Passport OS MY is a fork of [Passport OS](https://github.com/manchunx7-bit/passp
 
 - **English-only interface.** All on-screen text, voice tools and setup pages are in English. Fonts are Latin-only, which makes the app image about 500 KB smaller.
 - **Malaysian cities.** City search uses GeoNames places in Malaysia, grouped by state or Federal Territory. Kuala Lumpur is the default. The phone page still accepts a custom name and coordinates.
-- **Malaysian radio.** The station directory is queried for Malaysia (city, then state, then the whole country). MP3 and AAC/AAC+ streams are accepted. The presets are Traxx FM, BFM 89.9, Nasional FM, Klasik FM, ai FM and 988 FM.
+- **Malaysian radio.** Use ↑ and ↓ to browse local stations, built-in Malaysian presets and the full Malaysian directory of supported MP3 and AAC/AAC+ streams. The built-in stations also work when the directory is unavailable.
 - **Tech News instead of AI Hot.** Xiaozhi reads Hacker News front-page stories and recent AI stories.
 - **NetEase Cloud Music removed.** Asking Xiaozhi to play music plays live radio instead.
 - **Unchanged on purpose:** Malaysia time (UTC+8), Open-Meteo weather, the official xiaozhi.me backend, and the `Passport-WiFi-xxxx` setup hotspot.
